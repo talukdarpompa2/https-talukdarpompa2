@@ -1,0 +1,150 @@
+import argparse
+import json
+import uuid
+import os
+import subprocess
+import time
+from datetime import datetime
+from multiprocessing import Process, Event, current_process
+
+# -----------------------------------------------------------
+# Paths for persistence
+# -----------------------------------------------------------
+BASE_DIR = os.path.expanduser("~/.queuectl")
+QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")
+DLQ_FILE = os.path.join(BASE_DIR, "dlq.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+WORKER_FLAG = os.path.join(BASE_DIR, "worker.active")
+
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# -----------------------------------------------------------
+# Helpers for JSON storage
+# -----------------------------------------------------------
+def load_file(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
+
+def save_file(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        cfg = {"max_retries": 3, "backoff_base": 2}
+        save_file(CONFIG_FILE, cfg)
+        return cfg
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+# -----------------------------------------------------------
+# Create a new job and enqueue
+# -----------------------------------------------------------
+def enqueue_job(cmd):
+    queue = load_file(QUEUE_FILE)
+    now = datetime.utcnow().isoformat()
+    job = {
+        "id": str(uuid.uuid4()),
+        "command": cmd,
+        "state": "pending",
+        "attempt": 0,
+        "max_retries": load_config()["max_retries"],
+        "created_at": now,
+        "updated_at": now
+    }
+    queue.append(job)
+    save_file(QUEUE_FILE, queue)
+    print(f"[✓] Enqueued job: {job['id']}")
+
+# -----------------------------------------------------------
+# Worker execution logic
+# -----------------------------------------------------------
+def run_job(job):
+    """Executes job command and returns True/False."""
+    try:
+        result = subprocess.run(job["command"], shell=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def worker_loop(stop_event):
+    """Worker main loop: processes jobs until stop_event is set."""
+    print(f"[worker:{current_process().pid}] started")
+
+    while not stop_event.is_set():
+        queue = load_file(QUEUE_FILE)
+        
+        # get next pending job
+        pend = [j for j in queue if j["state"] == "pending"]
+        if not pend:
+            time.sleep(0.5)
+            continue
+
+        job = pend[0]
+        job["state"] = "processing"
+        job["updated_at"] = datetime.utcnow().isoformat()
+        save_file(QUEUE_FILE, queue)
+
+        ok = run_job(job)
+
+        if ok:
+            job["state"] = "completed"
+            job["updated_at"] = datetime.utcnow().isoformat()
+            print(f"[worker] job {job['id']} completed")
+        else:
+            job["attempt"] += 1
+            cfg = load_config()
+            if job["attempt"] > job["max_retries"]:
+                print(f"[worker] job {job['id']} moved to DLQ")
+                move_to_dlq(job)
+                queue.remove(job)
+            else:
+                # exponential backoff delay
+                delay = cfg["backoff_base"] ** (job["attempt"] - 1)
+                print(f"[worker] retrying {job['id']} after {delay}s")
+                job["state"] = "pending"
+                time.sleep(delay)
+
+        save_file(QUEUE_FILE, queue)
+
+    print(f"[worker:{current_process().pid}] stopping")
+
+def move_to_dlq(job):
+    dlq = load_file(DLQ_FILE)
+    job["state"] = "dead"
+    dlq.append(job)
+    save_file(DLQ_FILE, dlq)
+
+# -----------------------------------------------------------
+# Worker management
+# -----------------------------------------------------------
+def start_workers(n):
+    stop_event = Event()
+    with open(WORKER_FLAG, "w") as f:
+        f.write("active")
+
+    procs = []
+    for _ in range(n):
+        p = Process(target=worker_loop, args=(stop_event,))
+        p.start()
+        procs.append(p)
+
+    try:
+        for p in procs:
+            p.join()
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("[!] Stopping workers...")
+
+def stop_workers():
+    if os.path.exists(WORKER_FLAG):
+        os.remove(WORKER_FLAG)
+        print("[✓] Workers flagged to stop.")
+    else:
+        print("[i] No workers running.")
+
