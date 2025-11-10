@@ -1,0 +1,122 @@
+import argparse, sqlite3, subprocess, time, uuid, os, sys
+from datetime import datetime, timedelta
+
+HOME=os.path.join(os.path.expanduser("~"),".queuectl")
+DB=os.path.join(HOME,"queue.db")
+FLAG=os.path.join(HOME,"shutdown")
+
+SCHEMA="""
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS jobs(
+ id TEXT PRIMARY KEY,command TEXT,state TEXT,attempts INT,max_retries INT,
+ created_at TEXT,updated_at TEXT,next_run_at TEXT,last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_jobs ON jobs(state,next_run_at,created_at);
+CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT);
+INSERT OR IGNORE INTO config(key,value) VALUES('base_backoff','2'),('default_max_retries','3');
+"""
+
+now=lambda:datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+
+def cx():
+    os.makedirs(HOME,exist_ok=True)
+    c=sqlite3.connect(DB,isolation_level=None);c.row_factory=sqlite3.Row
+    c.executescript(SCHEMA);return c
+
+def cfg(c,k,d):r=c.execute("SELECT value FROM config WHERE key=?", (k,)).fetchone();return int(r["value"]) if r else d
+
+def enqueue(a):
+    c=cx();jid=a.id or str(uuid.uuid4())
+    mr=a.max_retries if a.max_retries!=None else cfg(c,"default_max_retries",3)
+    c.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,'')",
+              (jid,a.cmd,"pending",0,mr,now(),now(),now()))
+    print(jid)
+
+def claim(c):
+    with c:
+        r=c.execute("SELECT id FROM jobs WHERE state='pending' AND next_run_at<=? ORDER BY created_at LIMIT 1",(now(),)).fetchone()
+        if not r:return None
+        if c.execute("UPDATE jobs SET state='processing',updated_at=? WHERE id=? AND state='pending'",(now(),r["id"])).rowcount!=1:return None
+    return c.execute("SELECT * FROM jobs WHERE id=?", (r["id"],)).fetchone()
+
+def run(cmd):
+    try:p=subprocess.run(cmd,shell=True,capture_output=True,text=True);return p.returncode,(p.stdout or "")+(p.stderr or "")
+    except Exception as e:return 127,str(e)
+
+def worker_loop():
+    c=cx();base=cfg(c,"base_backoff",2)
+    while not os.path.exists(FLAG):
+        j=claim(c)
+        if not j:time.sleep(1.5);continue
+        rc,out=run(j["command"])
+        if rc==0:
+            c.execute("UPDATE jobs SET state='completed',updated_at=?,last_error='' WHERE id=?",(now(),j["id"]))
+        else:
+            att=j["attempts"]+1
+            if att<=j["max_retries"]:
+                nxt=(datetime.utcnow()+timedelta(seconds=max(1,base**att))).replace(microsecond=0).isoformat()+"Z"
+                c.execute("UPDATE jobs SET state='pending',attempts=?,updated_at=?,next_run_at=?,last_error=? WHERE id=?",
+                          (att,now(),nxt,out,j["id"]))
+            else:
+                c.execute("UPDATE jobs SET state='dead',attempts=?,updated_at=?,last_error=? WHERE id=?",
+                          (att,now(),out,j["id"]))
+
+def workers_start(a):
+    for _ in range(a.count):
+        subprocess.Popen([sys.executable,_file_,"--W"])
+    print(a.count)
+
+def workers_stop(_):
+    open(FLAG,"w").close()
+
+def status(_):
+    c=cx();s={k:0 for k in["pending","processing","completed","dead"]}
+    for x,n in c.execute("SELECT state,COUNT(*) FROM jobs GROUP BY state"):s[x]=n
+    print(s)
+
+def dlq_retry(a):
+    c=cx()
+    ids=[a.id] if a.id else [x["id"] for x in c.execute("SELECT id FROM jobs WHERE state='dead'")]
+    for j in ids:c.execute("UPDATE jobs SET state='pending',attempts=0,updated_at=?,next_run_at=?,last_error='' WHERE id=?",(now(),now(),j))
+    print(len(ids))
+
+def cfg_get(_):
+    c=cx()
+    for k,v in c.execute("SELECT key,value FROM config"):print(k,v)
+
+def cfg_set(a):
+    c=cx();c.execute("INSERT INTO config VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?", (a.key,str(a.value),str(a.value)))
+
+def parser():
+    p=argparse.ArgumentParser()
+    s=p.add_subparsers(dest="cmd",required=True)
+
+    e=s.add_parser("enqueue");e.add_argument("--cmd",required=True);e.add_argument("--max-retries",type=int);e.add_argument("--id");e.set_defaults(func=enqueue)
+
+    w=s.add_parser("workers");sw=w.add_subparsers(dest="sub",required=True)
+    ws=sw.add_parser("start");ws.add_argument("--count",type=int,default=1);ws.set_defaults(func=workers_start)
+    wk=sw.add_parser("stop");wk.set_defaults(func=workers_stop)
+
+    st=s.add_parser("status");st.set_defaults(func=status)
+
+    l=s.add_parser("list");l.add_argument("--state");l.add_argument("--limit",type=int,default=20);l.set_defaults(func=list_jobs)
+
+    d=s.add_parser("dlq");sd=d.add_subparsers(dest="sub",required=True)
+    dd=sd.add_parser("list");dd.set_defaults(func=dlq_list)
+    dr=sd.add_parser("retry");g=dr.add_mutually_exclusive_group(required=True);g.add_argument("--id");g.add_argument("--all",action="store_true")
+    dr.set_defaults(func=lambda a:dlq_retry(argparse.Namespace(id=None if a.all else a.id)))
+
+    c=s.add_parser("config");sc=c.add_subparsers(dest="sub",required=True)
+    cg=sc.add_parser("get");cg.set_defaults(func=cfg_get)
+    cs=sc.add_parser("set");cs.add_argument("key");cs.add_argument("value");cs.set_defaults(func=cfg_set)
+
+    p.add_argument("--W",action="store_true")
+    return p
+
+def main():
+    args=parser().parse_args()
+    if args._dict_.get("W"):return worker_loop()
+    args.func(args)
+
+if _name=="main_":main()
+
