@@ -1,0 +1,164 @@
+# https-talukdarpompa2
+import argparse, sqlite3, subprocess, time, uuid, os
+from datetime import datetime, timedelta
+
+DB = os.path.expanduser("~/.queuectl-mini.db")
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS jobs(
+  id TEXT PRIMARY KEY,
+  command TEXT NOT NULL,
+  state TEXT NOT NULL,          -- pending|processing|completed|dead
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 3,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  next_run_at TEXT NOT NULL,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_jobs_state_next ON jobs(state,next_run_at);
+CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT OR IGNORE INTO config(key,value) VALUES ('base_backoff','2'),('default_max_retries','3');
+"""
+
+def conn():
+    c = sqlite3.connect(DB, isolation_level=None); c.row_factory = sqlite3.Row
+    c.executescript(SCHEMA); return c
+
+def now(): return datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+
+def cfg(c, k, d): 
+    r = c.execute("SELECT value FROM config WHERE key=?", (k,)).fetchone()
+    return int(r["value"]) if r else d
+
+def enqueue(args):
+    c = conn()
+    jid = args.id or str(uuid.uuid4())
+    mr = args.max_retries if args.max_retries is not None else cfg(c,"default_max_retries",3)
+    c.execute("""INSERT INTO jobs(id,command,state,attempts,max_retries,created_at,updated_at,next_run_at)
+                 VALUES(?,?,?,?,?,?,?,?)""",
+              (jid,args.cmd,"pending",0,mr,now(),now(),now()))
+    print("enqueued", jid)
+
+def claim_one(c):
+    with c:  # atomic
+        row = c.execute("""SELECT id FROM jobs WHERE state='pending' AND next_run_at<=?
+                           ORDER BY created_at ASC LIMIT 1""",(now(),)).fetchone()
+        if not row: return None
+        u = c.execute("UPDATE jobs SET state='processing',updated_at=? WHERE id=? AND state='pending'",
+                      (now(),row["id"]))
+        if u.rowcount!=1: return None
+    return c.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+
+def run_cmd(cmd):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return 127, f"exception: {e!r}"
+
+def worker():
+    c = conn()
+    base = cfg(c,"base_backoff",2)
+    sleep_idle = args.poll
+    print("worker started; Ctrl+C to stop")
+    try:
+        while True:
+            job = claim_one(c)
+            if not job: time.sleep(sleep_idle); continue
+            rc, out = run_cmd(job["command"])
+            if rc==0:
+                c.execute("UPDATE jobs SET state='completed',updated_at=?,last_error=NULL WHERE id=?",
+                          (now(),job["id"]))
+            else:
+                att = job["attempts"]+1
+                if att<=job["max_retries"]:
+                    delay = max(1, base**att)    # exponential backoff
+                    nxt = (datetime.utcnow()+timedelta(seconds=delay)).replace(microsecond=0).isoformat()+"Z"
+                    c.execute("""UPDATE jobs SET state='pending',attempts=?,updated_at=?,next_run_at=?,last_error=?
+                                 WHERE id=?""",(att,now(),nxt,out.strip(),job["id"]))
+                else:
+                    c.execute("""UPDATE jobs SET state='dead',attempts=?,updated_at=?,last_error=? WHERE id=?""",
+                              (att,now(),out.strip(),job["id"]))
+    except KeyboardInterrupt:
+        print("\nworker stopped")
+
+def status(_):
+    c = conn()
+    states = {s:0 for s in ("pending","processing","completed","dead")}
+    for s,n in c.execute("SELECT state,COUNT(*) n FROM jobs GROUP BY state"): states[s]=n
+    for k,v in states.items(): print(f"{k:10} {v}")
+
+def lst(args):
+    c = conn()
+    q="SELECT * FROM jobs"; p=[]
+    if args.state: q+=" WHERE state=?"; p=[args.state]
+    q+=" ORDER BY created_at DESC LIMIT ?"; p.append(args.limit)
+    rows = c.execute(q,tuple(p)).fetchall()
+    if not rows: return print("(no jobs)")
+    for r in rows:
+        print({k:r[k] for k in r.keys()})
+
+def dlq(args):
+    c = conn()
+    if args.action=="list":
+        rows=c.execute("SELECT * FROM jobs WHERE state='dead' ORDER BY updated_at DESC").fetchall()
+        if not rows: return print("(DLQ empty)")
+        for r in rows: print({k:r[k] for k in r.keys()})
+    else:
+        if args.id:
+            ids=[args.id]
+        else:
+            ids=[x["id"] for x in c.execute("SELECT id FROM jobs WHERE state='dead'")]
+        for jid in ids:
+            c.execute("""UPDATE jobs SET state='pending',attempts=0,updated_at=?,next_run_at=?,last_error=NULL
+                         WHERE id=? AND state='dead'""",(now(),now(),jid))
+        print("retried", len(ids), "job(s)")
+
+def config(args):
+    c = conn()
+    if args.action=="get":
+        for k,v in c.execute("SELECT key,value FROM config ORDER BY key"): print(f"{k}: {v}")
+    else:
+        c.execute("""INSERT INTO config(key,value) VALUES(?,?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (args.key,str(args.value)))
+        print("set", args.key, "=", args.value)
+
+def parser():
+    p = argparse.ArgumentParser(prog="queuectl-mini", description="Small job queue with retries & DLQ")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    e=sub.add_parser("enqueue", help="Add a new job")
+    e.add_argument("--cmd", required=True); e.add_argument("--max-retries", type=int); e.add_argument("--id")
+    e.set_defaults(func=enqueue)
+
+    w=sub.add_parser("worker", help="Run one worker (start multiple for parallelism)")
+    w.add_argument("--poll", type=float, default=1.5, help="idle poll interval seconds")
+    w.set_defaults(func=worker)
+
+    s=sub.add_parser("status", help="Count jobs by state"); s.set_defaults(func=status)
+
+    l=sub.add_parser("list", help="List jobs"); 
+    l.add_argument("--state", choices=["pending","processing","completed","dead"])
+    l.add_argument("--limit", type=int, default=20); l.set_defaults(func=lst)
+
+    d=sub.add_parser("dlq", help="View/retry dead jobs")
+    d.add_argument("action", choices=["list","retry"])
+    d.add_argument("--id"); d.add_argument("--all", action="store_true")
+    d.set_defaults(func=lambda a: dlq(a if a.action=="list" else
+                                      argparse.Namespace(action=a.action, id=(None if a.all else a.id))))
+
+    c=sub.add_parser("config", help="Get/Set settings")
+    c.add_argument("action", choices=["get","set"])
+    c.add_argument("key", nargs="?"); c.add_argument("value", nargs="?")
+    c.set_defaults(func=lambda a: config(a) if a.action=="get" else config(a))
+
+    return p
+
+if _name=="main_":
+    args=parser().parse_args()
+    # tiny shim so dlq retry --all works
+    if args.cmd=="dlq" and args.action=="retry" and getattr(args,"all",False): args.id=None
+    args.func(args)
+
